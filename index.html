@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Metro Route Map</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <svg id="map" xmlns="http://www.w3.org/2000/svg" aria-label="Metro map"><g id="viewport"></g></svg>
+
+  <aside class="panel">
+    <header class="brand">
+      <div class="brand-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="14" rx="3"/><rect x="7.5" y="6" width="9" height="4.5" rx="1" fill="#f39800"/><circle cx="9" cy="13.5" r="1.2" fill="#f39800"/><circle cx="15" cy="13.5" r="1.2" fill="#f39800"/><path d="M8 17l-2 4M16 17l2 4" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </div>
+      <div>
+        <h1>Route Map</h1>
+        <p id="subtitle">Loading…</p>
+      </div>
+    </header>
+
+    <section class="controls">
+      <div class="segmented">
+        <button type="button" data-mode="schematic" class="active">Schematic</button>
+        <button type="button" data-mode="geographic">Geographic</button>
+      </div>
+      <label class="row">
+        <span>Line width</span>
+        <input type="range" id="lineWidth" min="3" max="10" step="1" value="6">
+      </label>
+      <label class="row check">
+        <input type="checkbox" id="showLabels" checked>
+        <span>Station names</span>
+      </label>
+      <div class="row buttons">
+        <button type="button" id="relayout">Re-run layout</button>
+        <label class="button">Load JSON…<input type="file" id="fileInput" accept=".json,application/json" hidden></label>
+      </div>
+    </section>
+
+    <section class="legend">
+      <h2>Lines</h2>
+      <ul id="legend"></ul>
+    </section>
+  </aside>
+
+  <div class="zoom">
+    <button type="button" id="zoomIn" title="Zoom in">+</button>
+    <button type="button" id="zoomOut" title="Zoom out">−</button>
+    <button type="button" id="zoomFit" title="Fit to screen">⤢</button>
+  </div>
+
+  <div id="tooltip" hidden></div>
+  <div id="message" hidden></div>
+
+  <script src="js/graph.js"></script>
+  <script src="js/layout.js"></script>
+  <script src="js/render.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
