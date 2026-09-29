@@ -62,9 +62,11 @@
       const x = Number(s.position.x);
       const y = Number(s.position.y);
       if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      const label = String(s.label ?? s.id);
       stations.set(s.id, {
         id: s.id,
-        label: String(s.label ?? s.id),
+        label,
+        labels: Array.isArray(s.labels) && s.labels.length ? s.labels.map(String) : [label],
         // Source data is y-up; the screen is y-down.
         geo: { x, y: -y },
         edges: [],
@@ -136,6 +138,49 @@
     return { stations, edges, lines, transfers, medianEdgeLength };
   }
 
+  // Returns a copy of `data` where each group of nearby stations (the pairs that
+  // buildGraph would link with a transfer) becomes one station carrying all names.
+  function mergeNearby(data) {
+    const graph = buildGraph(data);
+    if (!graph.transfers.length) return data;
+    const parent = new Map();
+    const find = (x) => {
+      while (parent.has(x)) x = parent.get(x);
+      return x;
+    };
+    for (const t of graph.transfers) {
+      const ra = find(t.a);
+      const rb = find(t.b);
+      if (ra !== rb) parent.set(rb, ra);
+    }
+
+    const groups = new Map();
+    for (const s of data.stations) {
+      if (!s || s.id == null || !s.position) continue;
+      const root = find(s.id);
+      if (!groups.has(root)) groups.set(root, []);
+      groups.get(root).push(s);
+    }
+    const stations = [...groups].map(([root, members]) => {
+      const labels = members.map((m) => String(m.label ?? m.id));
+      return {
+        id: root,
+        label: labels.join(' / '),
+        labels,
+        position: {
+          x: members.reduce((a, m) => a + Number(m.position.x), 0) / members.length,
+          y: members.reduce((a, m) => a + Number(m.position.y), 0) / members.length,
+        },
+      };
+    });
+    const lines = data.lines.map((l) => l && {
+      ...l,
+      edges: (l.edges || []).map((e) => e && { ...e, source: find(e.source), target: find(e.target) }),
+    });
+    return { stations, lines };
+  }
+
   MM.edgeKey = edgeKey;
   MM.buildGraph = buildGraph;
+  MM.mergeNearby = mergeNearby;
 })((window.MetroMap = window.MetroMap || {}));

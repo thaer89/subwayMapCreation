@@ -7,6 +7,20 @@
   const LINE_HEIGHT = FONT_SIZE * 1.15;
   const INTERCHANGE_STROKE = '#1b1b1b';
 
+  // Embedded in the live SVG and in PNG exports so both render identically.
+  const MAP_CSS = `
+.line path { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.line .casing { stroke: #fff; }
+.line .hit { stroke: transparent; pointer-events: stroke; cursor: pointer; }
+.transfer { fill: none; stroke-linecap: round; }
+.marker { cursor: pointer; }
+.label { font: 500 ${FONT_SIZE}px ${FONT_FAMILY}; fill: #1b1b1b; paint-order: stroke; stroke: #fff; stroke-width: 3px; stroke-linejoin: round; cursor: pointer; }
+.label.bold { font-weight: 700; }
+.line, .marker, .transfer, .label { transition: opacity 0.15s; }
+svg.dim .line, svg.dim .marker, svg.dim .transfer, svg.dim .label { opacity: 0.08; }
+svg.dim .line.active, svg.dim .marker.active, svg.dim .transfer.active, svg.dim .label.active { opacity: 1; }
+`;
+
   function el(tag, attrs, parent) {
     const node = document.createElementNS(SVG_NS, tag);
     for (const k in attrs) node.setAttribute(k, attrs[k]);
@@ -50,6 +64,49 @@
       upper.push(p);
     }
     return lower.slice(0, -1).concat(upper.slice(0, -1));
+  }
+
+  // Smallest rectangle (padded by `pad`) around `points`, trying octilinear
+  // orientations first and then the hull's own edge directions.
+  function orientedRect(points, pad) {
+    const angles = [0, Math.PI / 4];
+    for (let i = 0; i < points.length && points.length > 1; i++) {
+      const a = points[i];
+      const b = points[(i + 1) % points.length];
+      angles.push(Math.atan2(b.y - a.y, b.x - a.x));
+    }
+    let best = null;
+    for (const angle of angles) {
+      const c = Math.cos(angle);
+      const s = Math.sin(angle);
+      let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+      for (const p of points) {
+        const u = p.x * c + p.y * s;
+        const v = -p.x * s + p.y * c;
+        u0 = Math.min(u0, u); u1 = Math.max(u1, u);
+        v0 = Math.min(v0, v); v1 = Math.max(v1, v);
+      }
+      const w = u1 - u0 + 2 * pad;
+      const h = v1 - v0 + 2 * pad;
+      if (best && w * h >= best.w * best.h - 1) continue;
+      const uc = (u0 + u1) / 2;
+      const vc = (v0 + v1) / 2;
+      best = { kind: 'rect', cx: uc * c - vc * s, cy: uc * s + vc * c, w, h, angle: (angle * 180) / Math.PI };
+    }
+    return best;
+  }
+
+  function shapeBox(sh, extra) {
+    if (sh.kind === 'circle') {
+      const r = sh.r + extra;
+      return { x0: sh.cx - r, y0: sh.cy - r, x1: sh.cx + r, y1: sh.cy + r };
+    }
+    const a = (sh.angle * Math.PI) / 180;
+    const hw = sh.w / 2 + extra;
+    const hh = sh.h / 2 + extra;
+    const ex = Math.abs(Math.cos(a)) * hw + Math.abs(Math.sin(a)) * hh;
+    const ey = Math.abs(Math.sin(a)) * hw + Math.abs(Math.cos(a)) * hh;
+    return { x0: sh.cx - ex, y0: sh.cy - ey, x1: sh.cx + ex, y1: sh.cy + ey };
   }
 
   // Path through `pts` with arcs at corners; each point's `o` (line offset) keeps
@@ -136,7 +193,7 @@
 
   function render(root, graph, layout, opts) {
     const lineWidth = opts.lineWidth ?? 6;
-    const gap = Math.max(1.5, lineWidth * 0.35);
+    const gap = Math.max(0, opts.gap ?? lineWidth * 0.35);
     const spacing = lineWidth + gap;
     const hidden = opts.hidden || new Set();
     const visible = graph.lines.filter((l) => !hidden.has(l.id));
@@ -152,7 +209,6 @@
     const radius = unit * 0.45;
     const markerR = lineWidth * 0.8 + 1;
     const border = Math.max(1.5, lineWidth * 0.35);
-    const pad = markerR + border;
 
     const P = (id) => {
       const p = layout.pos.get(id);
@@ -217,23 +273,91 @@
       offsets.set(e.key, new Map(ls.map((l, i) => [l.id, ((k - 1) / 2 - i) * spacing])));
     }
 
+    // ---- Shared corridors ------------------------------------------------------
+    // Segments of different edges that lie on the same stretch of track are
+    // shifted apart so their bundles run side by side instead of on top of each
+    // other. Shifts are keyed by edge and segment index, along the canonical
+    // (a→b) left normal.
+    const segShift = new Map();
+    {
+      const segs = [];
+      for (const e of graph.edges.values()) {
+        const k = edgeLines.get(e.key).length;
+        if (!k) continue;
+        const p = polys.get(e.key);
+        for (let j = 0; j < p.length - 1; j++) {
+          if (Math.hypot(p[j + 1].x - p[j].x, p[j + 1].y - p[j].y) < 1e-6) continue;
+          segs.push({ e, j, a: p[j], b: p[j + 1], d: unitVec(p[j], p[j + 1]), width: k * spacing });
+        }
+      }
+      const cross = (u, v) => u.x * v.y - u.y * v.x;
+      const sub = (u, v) => ({ x: u.x - v.x, y: u.y - v.y });
+      const dot = (u, v) => u.x * v.x + u.y * v.y;
+      const sharesTrack = (s, t) => {
+        if (Math.abs(cross(s.d, t.d)) > 1e-6 || Math.abs(cross(s.d, sub(t.a, s.a))) > 0.5) return false;
+        const len = Math.hypot(s.b.x - s.a.x, s.b.y - s.a.y);
+        const t0 = dot(sub(t.a, s.a), s.d);
+        const t1 = dot(sub(t.b, s.a), s.d);
+        return Math.min(len, Math.max(t0, t1)) - Math.max(0, Math.min(t0, t1)) > 1;
+      };
+      const parent = segs.map((_, i) => i);
+      const find = (i) => {
+        while (parent[i] !== i) i = parent[i] = parent[parent[i]];
+        return i;
+      };
+      for (let i = 0; i < segs.length; i++) {
+        for (let j = i + 1; j < segs.length; j++) {
+          if (segs[i].e !== segs[j].e && sharesTrack(segs[i], segs[j])) parent[find(j)] = find(i);
+        }
+      }
+      const groups = new Map();
+      segs.forEach((s, i) => {
+        const r = find(i);
+        if (!groups.has(r)) groups.set(r, []);
+        groups.get(r).push(s);
+      });
+      for (const group of groups.values()) {
+        const ref = group[0];
+        const refN = leftNormal(ref.d);
+        const byEdge = new Map();
+        for (const s of group) {
+          if (!byEdge.has(s.e)) byEdge.set(s.e, { e: s.e, segs: [], width: s.width });
+          byEdge.get(s.e).segs.push(s);
+        }
+        if (byEdge.size < 2) continue;
+        // Edges that swing further to the left of the shared stretch take the left slot.
+        const items = [...byEdge.values()];
+        for (const it of items) {
+          it.side = polys.get(it.e.key).reduce((acc, p) => acc + dot(sub(p, ref.a), refN), 0);
+        }
+        items.sort((x, y) => y.side - x.side);
+        const total = items.reduce((acc, it) => acc + it.width, 0);
+        let acc = 0;
+        for (const it of items) {
+          const center = total / 2 - acc - it.width / 2;
+          acc += it.width;
+          for (const s of it.segs) segShift.set(`${s.e.key}:${s.j}`, dot(s.d, ref.d) > 0 ? center : -center);
+        }
+      }
+    }
+    const shiftOf = (e, j) => segShift.get(`${e.key}:${j}`) || 0;
+
     // ---- Offset polylines per line ------------------------------------------
     function chainPoints(line, chain) {
       const st = chain.stations;
       const segs = [];
       for (let i = 0; i < st.length - 1; i++) {
         const e = edgeOf(st[i], st[i + 1]);
-        let pts = polys.get(e.key);
-        let o = offsets.get(e.key).get(line.id);
-        if (st[i] !== e.a) {
-          pts = pts.slice().reverse();
-          o = -o;
-        }
+        const reversed = st[i] !== e.a;
+        const pts = reversed ? polys.get(e.key).slice().reverse() : polys.get(e.key);
+        const lineOffset = offsets.get(e.key).get(line.id);
         for (let j = 0; j < pts.length - 1; j++) {
           const p1 = pts[j];
           const p2 = pts[j + 1];
           const len = Math.hypot(p2.x - p1.x, p2.y - p1.y);
           if (len < 1e-6) continue;
+          const canonical = reversed ? pts.length - 2 - j : j;
+          const o = (lineOffset + shiftOf(e, canonical)) * (reversed ? -1 : 1);
           const d = unitVec(p1, p2);
           const n = leftNormal(d);
           segs.push({
@@ -283,8 +407,9 @@
         const res = chainPoints(line, chain);
         if (!res) continue;
         const d = roundedPath(res.pts, res.closed, radius, markerR * 0.5);
-        el('path', { d, class: 'casing', 'stroke-width': fmt(lineWidth + gap * 1.6) }, g);
+        el('path', { d, class: 'casing', 'stroke-width': fmt(lineWidth + Math.min(gap * 1.6, 6)) }, g);
         el('path', { d, class: 'stroke', stroke: line.color, 'stroke-width': lineWidth }, g);
+        el('path', { d, class: 'hit', 'stroke-width': fmt(Math.max(lineWidth + 8, 14)) }, g);
         const p = res.pts;
         for (let i = 0; i < p.length - 1; i++) obstacles.push([p[i], p[i + 1]]);
         if (res.closed) obstacles.push([p[p.length - 1], p[0]]);
@@ -303,19 +428,12 @@
         const atA = s.id === e.a;
         const base = atA ? p[0] : p[p.length - 1];
         const n = leftNormal(atA ? unitVec(p[0], p[1]) : unitVec(p[p.length - 2], p[p.length - 1]));
-        for (const o of off.values()) pts.push({ x: base.x + n.x * o, y: base.y + n.y * o });
+        const shift = shiftOf(e, atA ? 0 : p.length - 2);
+        for (const o of off.values()) pts.push({ x: base.x + n.x * (o + shift), y: base.y + n.y * (o + shift) });
         for (const l of edgeLines.get(e.key)) lines.add(l);
       }
       if (!lines.size) continue;
-      const hull = convexHull(pts);
-      const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
-      for (const p of hull) {
-        box.x0 = Math.min(box.x0, p.x - pad);
-        box.y0 = Math.min(box.y0, p.y - pad);
-        box.x1 = Math.max(box.x1, p.x + pad);
-        box.y1 = Math.max(box.y1, p.y + pad);
-      }
-      info.set(s.id, { station: s, center: P(s.id), hull, box, lines: [...lines], transfer: false });
+      info.set(s.id, { station: s, center: P(s.id), hull: convexHull(pts), lines: [...lines], transfer: false });
     }
     const transfers = graph.transfers.filter((t) => info.has(t.a) && info.has(t.b));
     for (const t of transfers) {
@@ -323,26 +441,52 @@
       info.get(t.b).transfer = true;
     }
 
-    const gOuter = el('g', { class: 'markers-outer' }, root);
-    const gInner = el('g', { class: 'markers-inner' }, root);
-    const linkR = markerR * 0.7;
+    const shapeR = markerR + border / 2;
+    for (const s of info.values()) {
+      s.interchange = s.lines.length > 1 || s.transfer || s.station.labels.length > 1;
+      if (s.interchange) {
+        s.shape = orientedRect(s.hull, shapeR);
+      } else {
+        const c = s.hull.reduce((a, p) => ({ x: a.x + p.x / s.hull.length, y: a.y + p.y / s.hull.length }), { x: 0, y: 0 });
+        s.shape = { kind: 'circle', cx: c.x, cy: c.y, r: markerR };
+      }
+      s.box = shapeBox(s.shape, border / 2);
+    }
+
+    const gConnectors = el('g', { class: 'connectors' }, root);
+    const gMarkers = el('g', { class: 'markers' }, root);
+    const gConnectorFill = el('g', { class: 'connectors-fill' }, root);
+    const linkR = markerR * 0.6;
     for (const t of transfers) {
       const d = `M${pt(info.get(t.a).center)}L${pt(info.get(t.b).center)}`;
       const lines = [...new Set([...info.get(t.a).lines, ...info.get(t.b).lines])].map((l) => l.id).join(' ');
-      el('path', { d, class: 'transfer', stroke: INTERCHANGE_STROKE, 'stroke-width': fmt(2 * (linkR + border)), 'data-lines': lines }, gOuter);
-      el('path', { d, class: 'transfer', stroke: '#fff', 'stroke-width': fmt(2 * linkR), 'data-lines': lines }, gInner);
+      el('path', { d, class: 'transfer', stroke: INTERCHANGE_STROKE, 'stroke-width': fmt(2 * (linkR + border)), 'data-lines': lines }, gConnectors);
+      el('path', { d, class: 'transfer', stroke: '#fff', 'stroke-width': fmt(2 * linkR), 'data-lines': lines }, gConnectorFill);
       obstacles.push([info.get(t.a).center, info.get(t.b).center]);
     }
     for (const [id, s] of info) {
-      const h = s.hull;
-      const d = h.length === 1
-        ? `M${pt(h[0])}h0.01`
-        : `M${h.map(pt).join('L')}${h.length > 2 ? 'Z' : ''}`;
-      const interchange = s.lines.length > 1 || s.transfer;
-      const ring = interchange ? INTERCHANGE_STROKE : s.lines[0].color;
-      const common = { d, class: 'marker', 'data-station': id, 'data-lines': s.lines.map((l) => l.id).join(' ') };
-      el('path', { ...common, stroke: ring, fill: ring, 'stroke-width': fmt(2 * pad) }, gOuter);
-      el('path', { ...common, stroke: '#fff', fill: '#fff', 'stroke-width': fmt(2 * markerR) }, gInner);
+      const common = {
+        class: 'marker',
+        fill: '#fff',
+        'stroke-width': fmt(border),
+        'data-station': id,
+        'data-lines': s.lines.map((l) => l.id).join(' '),
+      };
+      const sh = s.shape;
+      if (sh.kind === 'circle') {
+        el('circle', { ...common, cx: fmt(sh.cx), cy: fmt(sh.cy), r: fmt(sh.r), stroke: s.lines[0].color }, gMarkers);
+      } else {
+        el('rect', {
+          ...common,
+          x: fmt(-sh.w / 2),
+          y: fmt(-sh.h / 2),
+          width: fmt(sh.w),
+          height: fmt(sh.h),
+          rx: fmt(Math.min(sh.w, sh.h) * 0.32),
+          transform: `translate(${fmt(sh.cx)} ${fmt(sh.cy)}) rotate(${fmt(sh.angle)})`,
+          stroke: INTERCHANGE_STROKE,
+        }, gMarkers);
+      }
     }
 
     // ---- Labels ---------------------------------------------------------------
@@ -373,13 +517,15 @@
       ];
 
       for (const s of ordered) {
-        const bold = s.lines.length > 1 || s.transfer;
+        const bold = s.interchange;
         const font = `${bold ? 700 : 500} ${FONT_SIZE}px ${FONT_FAMILY}`;
         const b = s.box;
         const cx = (b.x0 + b.x1) / 2;
         const cy = (b.y0 + b.y1) / 2;
         let best = null;
-        splitLabel(s.station.label).forEach((lines, variant) => {
+        const names = s.station.labels;
+        const variants = names.length > 1 ? [names, [names.join(' / ')]] : splitLabel(s.station.label);
+        variants.forEach((lines, variant) => {
           const w = Math.max(...lines.map((t) => textWidth(t, font)));
           const h = lines.length * LINE_HEIGHT;
           for (const c of candidates) {
@@ -429,4 +575,5 @@
   }
 
   MM.render = render;
+  MM.MAP_CSS = MAP_CSS;
 })((window.MetroMap = window.MetroMap || {}));

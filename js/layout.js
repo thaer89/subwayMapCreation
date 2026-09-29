@@ -10,7 +10,7 @@
     bend: 2.5,
     crossing: 16,
     transferCrossing: 4,
-    overlap: 80,
+    overlap: 400, // two edges drawn on top of each other: effectively forbidden
     nodeOnEdge: 60,
     nodeNearEdge: 4,
     nodeNearNode: 3,
@@ -113,6 +113,20 @@
     }
     return best;
   }
+  // Polyline with the end at (x, y) pulled slightly inwards, so edges that only
+  // share that endpoint are not reported as intersecting there.
+  function trimEnd(p, x, y) {
+    const q = p.slice();
+    const n = q.length;
+    const [i, j] = q[0] === x && q[1] === y ? [0, 2] : [n - 2, n - 4];
+    const dx = q[j] - q[i];
+    const dy = q[j + 1] - q[i + 1];
+    const L = Math.hypot(dx, dy) || 1;
+    q[i] += (dx / L) * 0.05;
+    q[i + 1] += (dy / L) * 0.05;
+    return q;
+  }
+
   function bbox(p) {
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (let i = 0; i < p.length; i += 2) {
@@ -306,13 +320,32 @@
       for (let f = 0; f < E.length; f++) {
         if (f === k) continue;
         const g = E[f];
-        if (g.u === e.u || g.u === e.v || g.v === e.u || g.v === e.v) continue;
         const q = poly(f);
         const [qx0, qy0, qx1, qy1] = bbox(q);
         if (qx1 < x0 || qx0 > x1 || qy1 < y0 || qy0 > y1) continue;
-        if (polylinesIntersect(p, q)) c += e.transfer || g.transfer ? W.transferCrossing : W.crossing;
+        const shared = g.u === e.u || g.u === e.v ? g.u : g.v === e.u || g.v === e.v ? g.v : -1;
+        if (shared < 0) {
+          if (polylinesIntersect(p, q)) c += e.transfer || g.transfer ? W.transferCrossing : W.crossing;
+        } else if (!e.transfer && !g.transfer) {
+          const sx = X[shared];
+          const sy = Y[shared];
+          if (polylinesIntersect(trimEnd(p, sx, sy), trimEnd(q, sx, sy))) c += W.overlap;
+        }
       }
       return c;
+    }
+
+    // Choose the bend order of node i's bent edges so none leaves a station along
+    // the same direction as another edge.
+    function fixFlips(i) {
+      for (const k of inc[i]) {
+        const e = E[k];
+        if (e.transfer || isOctilinear(X[e.v] - X[e.u], Y[e.v] - Y[e.u])) continue;
+        const before = overlapAt(e.u) + overlapAt(e.v);
+        if (!before) continue;
+        e.flip = !e.flip;
+        if (overlapAt(e.u) + overlapAt(e.v) >= before) e.flip = !e.flip;
+      }
     }
 
     const proximity = (d) => (d < 0.01 ? W.nodeOnEdge : d < 0.75 ? W.nodeNearEdge : 0);
@@ -349,6 +382,75 @@
       return c;
     }
 
+    // Moves node i to the best free cell within radius r; returns true if it moved.
+    function tryMove(i, r) {
+      const ox = X[i];
+      const oy = Y[i];
+      const savedFlips = inc[i].map((k) => E[k].flip);
+      const setFlips = (flips) => inc[i].forEach((k, n) => (E[k].flip = flips[n]));
+      fixFlips(i);
+      let best = localCost(i);
+      let bestFlips = inc[i].map((k) => E[k].flip);
+      let bx = ox;
+      let by = oy;
+      occupied.delete(cell(ox, oy));
+      for (let dx = -r; dx <= r; dx++) {
+        for (let dy = -r; dy <= r; dy++) {
+          if (!dx && !dy) continue;
+          const x = ox + dx;
+          const y = oy + dy;
+          if (occupied.has(cell(x, y))) continue;
+          X[i] = x;
+          Y[i] = y;
+          setFlips(savedFlips);
+          fixFlips(i);
+          const c = localCost(i);
+          if (c < best - 1e-6) {
+            best = c;
+            bx = x;
+            by = y;
+            bestFlips = inc[i].map((k) => E[k].flip);
+          }
+        }
+      }
+      X[i] = bx;
+      Y[i] = by;
+      setFlips(bestFlips);
+      occupied.set(cell(bx, by), i);
+      return bx !== ox || by !== oy;
+    }
+
+    function flipPass() {
+      let changed = 0;
+      for (const e of E) {
+        if (e.transfer || isOctilinear(X[e.v] - X[e.u], Y[e.v] - Y[e.u])) continue;
+        const before = localCost(e.u) + localCost(e.v);
+        e.flip = !e.flip;
+        if (localCost(e.u) + localCost(e.v) >= before - 1e-6) e.flip = !e.flip;
+        else changed++;
+      }
+      return changed;
+    }
+
+    // Nodes at either end of edges that are drawn on top of another edge.
+    function overlappingNodes() {
+      const bad = new Set();
+      for (let k = 0; k < E.length; k++) {
+        const e = E[k];
+        if (e.transfer) continue;
+        for (let f = k + 1; f < E.length; f++) {
+          const g = E[f];
+          if (g.transfer) continue;
+          const s = g.u === e.u || g.u === e.v ? g.u : g.v === e.u || g.v === e.v ? g.v : -1;
+          if (s < 0) continue;
+          if (polylinesIntersect(trimEnd(poly(k), X[s], Y[s]), trimEnd(poly(f), X[s], Y[s]))) {
+            [e.u, e.v, g.u, g.v].forEach((n) => bad.add(n));
+          }
+        }
+      }
+      return bad;
+    }
+
     const order = [...Array(N).keys()];
     const maxIterations = opts.iterations ?? 40;
     for (let iter = 0; iter < maxIterations; iter++) {
@@ -358,42 +460,18 @@
         [order[i], order[j]] = [order[j], order[i]];
       }
       let changed = 0;
-      for (const i of order) {
-        const ox = X[i];
-        const oy = Y[i];
-        let best = localCost(i);
-        let bx = ox;
-        let by = oy;
-        occupied.delete(cell(ox, oy));
-        for (let dx = -r; dx <= r; dx++) {
-          for (let dy = -r; dy <= r; dy++) {
-            if (!dx && !dy) continue;
-            const x = ox + dx;
-            const y = oy + dy;
-            if (occupied.has(cell(x, y))) continue;
-            X[i] = x;
-            Y[i] = y;
-            const c = localCost(i);
-            if (c < best - 1e-6) {
-              best = c;
-              bx = x;
-              by = y;
-            }
-          }
-        }
-        X[i] = bx;
-        Y[i] = by;
-        occupied.set(cell(bx, by), i);
-        if (bx !== ox || by !== oy) changed++;
-      }
-      for (const e of E) {
-        if (e.transfer || isOctilinear(X[e.v] - X[e.u], Y[e.v] - Y[e.u])) continue;
-        const before = localCost(e.u) + localCost(e.v);
-        e.flip = !e.flip;
-        if (localCost(e.u) + localCost(e.v) >= before - 1e-6) e.flip = !e.flip;
-        else changed++;
-      }
+      for (const i of order) if (tryMove(i, r)) changed++;
+      changed += flipPass();
       if (!changed && r === 1) break;
+    }
+
+    // Repair: give stations involved in an overlap a wider search, then polish.
+    for (let round = 0; round < 6; round++) {
+      const bad = overlappingNodes();
+      if (!bad.size) break;
+      for (const i of bad) tryMove(i, 4);
+      for (const i of order) tryMove(i, 1);
+      flipPass();
     }
 
     let minX = Infinity;
@@ -407,18 +485,24 @@
     const flip = new Map();
     let nonOctilinear = 0;
     let crossings = 0;
+    let overlaps = 0;
     E.forEach((e, k) => {
       if (e.transfer) return;
       flip.set(e.key, e.flip);
       if (!isOctilinear(X[e.v] - X[e.u], Y[e.v] - Y[e.u])) nonOctilinear++;
       for (let f = k + 1; f < E.length; f++) {
         const g = E[f];
-        if (g.transfer || g.u === e.u || g.u === e.v || g.v === e.u || g.v === e.v) continue;
-        if (polylinesIntersect(poly(k), poly(f))) crossings++;
+        if (g.transfer) continue;
+        const shared = g.u === e.u || g.u === e.v ? g.u : g.v === e.u || g.v === e.v ? g.v : -1;
+        if (shared < 0) {
+          if (polylinesIntersect(poly(k), poly(f))) crossings++;
+        } else if (polylinesIntersect(trimEnd(poly(k), X[shared], Y[shared]), trimEnd(poly(f), X[shared], Y[shared]))) {
+          overlaps++;
+        }
       }
     });
 
-    return { pos, flip, schematic: true, stats: { nonOctilinear, crossings } };
+    return { pos, flip, schematic: true, stats: { nonOctilinear, crossings, overlaps } };
   }
 
   MM.gridPolyline = gridPolyline;

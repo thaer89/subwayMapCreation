@@ -28,19 +28,30 @@
       <label class="row">
         <span>Line width</span>
         <input type="range" id="lineWidth" min="3" max="10" step="1" value="6">
+        <output></output>
+      </label>
+      <label class="row">
+        <span>Line spacing</span>
+        <input type="range" id="lineGap" min="0" max="12" step="0.5" value="2">
+        <output></output>
       </label>
       <label class="row check">
         <input type="checkbox" id="showLabels" checked>
         <span>Station names</span>
       </label>
+      <label class="row check" title="Stations that almost overlap (e.g. Ueno / Ueno Halt) become one station showing both names">
+        <input type="checkbox" id="mergeNearby">
+        <span>Merge nearby stations</span>
+      </label>
       <div class="row buttons">
         <button type="button" id="relayout">Re-run layout</button>
         <label class="button">Load JSON…<input type="file" id="fileInput" accept=".json,application/json" hidden></label>
       </div>
+      <button type="button" id="exportPng" class="primary">Export PNG</button>
     </section>
 
     <section class="legend">
-      <h2>Lines</h2>
+      <h2>Lines <small>click to focus · ● to hide</small></h2>
       <ul id="legend"></ul>
     </section>
   </aside>
@@ -51,6 +62,7 @@
     <button type="button" id="zoomFit" title="Fit to screen">⤢</button>
   </div>
 
+  <div id="focusBar" hidden></div>
   <div id="tooltip" hidden></div>
   <div id="message" hidden></div>
 
