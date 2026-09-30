@@ -1,6 +1,8 @@
 (function (MM) {
   'use strict';
 
+  const { polylinesIntersect, distanceToPolyline, polylineBounds } = MM.geometry;
+
   // Penalty weights for the schematic optimiser. Positions are integer grid cells.
   const BASE_WEIGHTS = {
     nonOctilinear: 30,
@@ -21,6 +23,10 @@
   // Penalty for a line turning by 0°, 45°, 90°, 135°, 180° at a station.
   const BEND_TABLE = [0, 1, 4, 25, 60];
   const MIN_LENGTH = 2;
+  // Grid cells per median edge length.
+  const DEFAULT_TARGET_EDGE = 2.6;
+  // Smallest cost decrease accepted as an improvement, to avoid float churn.
+  const MIN_GAIN = 1e-6;
 
   function mulberry32(seed) {
     let a = seed | 0;
@@ -38,6 +44,7 @@
     return d > 4 ? 8 - d : d;
   };
   const isOctilinear = (dx, dy) => dx === 0 || dy === 0 || Math.abs(dx) === Math.abs(dy);
+  const cellKey = (x, y) => (x + 4096) * 8192 + (y + 4096);
 
   function bendPenalty(turn) {
     const x = turn / (Math.PI / 4);
@@ -71,49 +78,6 @@
     return [ax, ay, cx, cy, bx, by];
   }
 
-  function orient(ax, ay, bx, by, cx, cy) {
-    const v = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-    return v > 1e-9 ? 1 : v < -1e-9 ? -1 : 0;
-  }
-  function onSegment(ax, ay, bx, by, cx, cy) {
-    return (
-      Math.min(ax, bx) - 1e-9 <= cx && cx <= Math.max(ax, bx) + 1e-9 &&
-      Math.min(ay, by) - 1e-9 <= cy && cy <= Math.max(ay, by) + 1e-9
-    );
-  }
-  function segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy) {
-    const o1 = orient(ax, ay, bx, by, cx, cy);
-    const o2 = orient(ax, ay, bx, by, dx, dy);
-    const o3 = orient(cx, cy, dx, dy, ax, ay);
-    const o4 = orient(cx, cy, dx, dy, bx, by);
-    if (o1 !== o2 && o3 !== o4) return true;
-    if (o1 === 0 && onSegment(ax, ay, bx, by, cx, cy)) return true;
-    if (o2 === 0 && onSegment(ax, ay, bx, by, dx, dy)) return true;
-    if (o3 === 0 && onSegment(cx, cy, dx, dy, ax, ay)) return true;
-    if (o4 === 0 && onSegment(cx, cy, dx, dy, bx, by)) return true;
-    return false;
-  }
-  function polylinesIntersect(p, q) {
-    for (let i = 0; i + 3 < p.length; i += 2) {
-      for (let j = 0; j + 3 < q.length; j += 2) {
-        if (segmentsIntersect(p[i], p[i + 1], p[i + 2], p[i + 3], q[j], q[j + 1], q[j + 2], q[j + 3])) return true;
-      }
-    }
-    return false;
-  }
-  function distanceToPolyline(x, y, p) {
-    let best = Infinity;
-    for (let i = 0; i + 3 < p.length; i += 2) {
-      const ax = p[i];
-      const ay = p[i + 1];
-      const vx = p[i + 2] - ax;
-      const vy = p[i + 3] - ay;
-      const len2 = vx * vx + vy * vy;
-      const t = len2 ? Math.max(0, Math.min(1, ((x - ax) * vx + (y - ay) * vy) / len2)) : 0;
-      best = Math.min(best, Math.hypot(x - (ax + vx * t), y - (ay + vy * t)));
-    }
-    return best;
-  }
   // Polyline with the end at (x, y) pulled slightly inwards, so edges that only
   // share that endpoint are not reported as intersecting there.
   function trimEnd(p, x, y) {
@@ -128,15 +92,11 @@
     return q;
   }
 
-  function bbox(p) {
-    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    for (let i = 0; i < p.length; i += 2) {
-      if (p[i] < x0) x0 = p[i];
-      if (p[i] > x1) x1 = p[i];
-      if (p[i + 1] < y0) y0 = p[i + 1];
-      if (p[i + 1] > y1) y1 = p[i + 1];
-    }
-    return [x0, y0, x1, y1];
+  // Node index shared by edges e and g, or -1.
+  function sharedNode(e, g) {
+    if (g.u === e.u || g.u === e.v) return g.u;
+    if (g.v === e.u || g.v === e.v) return g.v;
+    return -1;
   }
 
   function normalizedGeo(graph, scale) {
@@ -154,7 +114,7 @@
   }
 
   function layoutGeographic(graph, opts = {}) {
-    const scale = (opts.targetEdge ?? 2.6) / graph.medianEdgeLength;
+    const scale = (opts.targetEdge ?? DEFAULT_TARGET_EDGE) / graph.medianEdgeLength;
     return { pos: normalizedGeo(graph, scale), flip: new Map(), schematic: false, stats: null };
   }
 
@@ -169,14 +129,16 @@
     return best;
   }
 
-  function optimise(graph, opts, seed) {
-    const W = { ...BASE_WEIGHTS, ...opts.weights };
-    const rand = mulberry32(seed * 9973 + 17);
-    const scale = (opts.targetEdge ?? 2.6) / graph.medianEdgeLength;
+  // ---- Problem setup ----------------------------------------------------------
+  // Stations become node indices 0..N-1 with geographic target positions (gx, gy)
+  // in grid units. Track edges and transfers become entries of `edges`.
+  function buildProblem(graph, opts, W) {
+    const targetEdge = opts.targetEdge ?? DEFAULT_TARGET_EDGE;
+    const scale = targetEdge / graph.medianEdgeLength;
     const geo = normalizedGeo(graph, scale);
     const nodes = [...graph.stations.values()];
     const N = nodes.length;
-    const idx = new Map(nodes.map((s, i) => [s.id, i]));
+    const index = new Map(nodes.map((s, i) => [s.id, i]));
     const gx = new Float64Array(N);
     const gy = new Float64Array(N);
     nodes.forEach((s, i) => {
@@ -184,95 +146,95 @@
       gy[i] = geo.get(s.id).y;
     });
 
-    const E = [];
+    const edges = [];
     const edgeIndex = new Map();
     for (const edge of graph.edges.values()) {
-      const u = idx.get(edge.a);
-      const v = idx.get(edge.b);
-      edgeIndex.set(edge.key, E.length);
-      E.push({
+      const u = index.get(edge.a);
+      const v = index.get(edge.b);
+      edgeIndex.set(edge.key, edges.length);
+      edges.push({
         key: edge.key, u, v, transfer: false, flip: false,
         ideal: Math.max(MIN_LENGTH, edge.geoLength * scale),
         sector: sectorOf(gx[v] - gx[u], gy[v] - gy[u]),
       });
     }
     for (const t of graph.transfers) {
-      E.push({ key: t.key, u: idx.get(t.a), v: idx.get(t.b), transfer: true, flip: false, ideal: 1, sector: 0 });
+      edges.push({ key: t.key, u: index.get(t.a), v: index.get(t.b), transfer: true, flip: false, ideal: 1, sector: 0 });
     }
-    const inc = Array.from({ length: N }, () => []);
-    const nbrs = Array.from({ length: N }, () => new Set());
-    E.forEach((e, k) => {
-      inc[e.u].push(k);
-      inc[e.v].push(k);
-      nbrs[e.u].add(e.v);
-      nbrs[e.v].add(e.u);
+    const incident = Array.from({ length: N }, () => []);
+    const neighbours = Array.from({ length: N }, () => new Set());
+    edges.forEach((e, k) => {
+      incident[e.u].push(k);
+      incident[e.v].push(k);
+      neighbours[e.u].add(e.v);
+      neighbours[e.v].add(e.u);
     });
 
-    // Consecutive edge pairs along each line, used to keep lines straight.
+    return {
+      nodes, N, gx, gy, edges, incident, neighbours,
+      ...buildBends(graph, index, edgeIndex, N),
+      ...buildOrderPairs(N, gx, gy, neighbours, 2 * targetEdge, W.order),
+    };
+  }
+
+  // Consecutive edge pairs along each line, used to keep lines straight. A pair
+  // shared by several lines is stored once with a higher weight.
+  function buildBends(graph, index, edgeIndex, N) {
     const bends = [];
     const bendsAt = Array.from({ length: N }, () => []);
-    const bendSeen = new Map();
+    const byKey = new Map();
     const addBend = (a, b, c) => {
       const key = a < c ? `${a}|${b}|${c}` : `${c}|${b}|${a}`;
-      if (bendSeen.has(key)) {
-        bendSeen.get(key).weight += 1;
+      if (byKey.has(key)) {
+        byKey.get(key).weight += 1;
         return;
       }
       const k = bends.length;
-      const bend = { b: idx.get(b), e1: edgeIndex.get(MM.edgeKey(a, b)), e2: edgeIndex.get(MM.edgeKey(b, c)), weight: 1 };
-      bendSeen.set(key, bend);
+      const bend = { b: index.get(b), e1: edgeIndex.get(MM.edgeKey(a, b)), e2: edgeIndex.get(MM.edgeKey(b, c)), weight: 1 };
+      byKey.set(key, bend);
       bends.push(bend);
-      bendsAt[idx.get(a)].push(k);
-      bendsAt[idx.get(b)].push(k);
-      bendsAt[idx.get(c)].push(k);
+      bendsAt[index.get(a)].push(k);
+      bendsAt[index.get(b)].push(k);
+      bendsAt[index.get(c)].push(k);
     };
     for (const line of graph.lines) {
-      for (const ch of line.chains) {
-        const st = ch.stations;
+      for (const chain of line.chains) {
+        const st = chain.stations;
         const n = st.length;
         for (let i = 1; i < n - 1; i++) addBend(st[i - 1], st[i], st[i + 1]);
-        if (ch.closed && n > 3) addBend(st[n - 2], st[0], st[1]);
+        if (chain.closed && n > 3) addBend(st[n - 2], st[0], st[1]);
       }
     }
+    return { bends, bendsAt };
+  }
 
-    // Station pairs whose relative position (which one is further east / north)
-    // should survive schematisation: connected stations plus geographic neighbours.
+  // Station pairs whose relative position (which one is further east / north)
+  // should survive schematisation: connected stations plus geographic neighbours
+  // within `radius`. (ux, uy) is the geographic direction from i to j.
+  function buildOrderPairs(N, gx, gy, neighbours, radius, weight) {
     const pairs = [];
     const pairsAt = Array.from({ length: N }, () => []);
-    const orderRadius = 2 * (opts.targetEdge ?? 2.6); // two median edge lengths
     for (let i = 0; i < N; i++) {
       for (let j = i + 1; j < N; j++) {
         const dx = gx[j] - gx[i];
         const dy = gy[j] - gy[i];
         const d = Math.hypot(dx, dy);
-        const linked = nbrs[i].has(j);
-        if (!d || (!linked && d > orderRadius)) continue;
-        const pair = { i, j, ux: dx / d, uy: dy / d, weight: W.order * (linked ? 1.5 : 1) };
+        const linked = neighbours[i].has(j);
+        if (!d || (!linked && d > radius)) continue;
         pairsAt[i].push(pairs.length);
         pairsAt[j].push(pairs.length);
-        pairs.push(pair);
+        pairs.push({ i, j, ux: dx / d, uy: dy / d, weight: weight * (linked ? 1.5 : 1) });
       }
     }
-    const orderCost = (pi) => {
-      const p = pairs[pi];
-      const dx = X[p.j] - X[p.i];
-      const dy = Y[p.j] - Y[p.i];
-      const side = (d, u) => {
-        const a = Math.abs(u);
-        if (a >= 0.3 && Math.sign(d) === -Math.sign(u)) return a;
-        if (a >= 0.6 && d === 0) return a * 0.4; // clearly east (say) but drawn level
-        return 0;
-      };
-      return p.weight * (side(dx, p.ux) + side(dy, p.uy));
-    };
+    return { pairs, pairsAt };
+  }
 
+  // Snaps geography to the nearest free grid cells, busiest stations first.
+  function snapToGrid({ N, gx, gy, incident }) {
     const X = new Int32Array(N);
     const Y = new Int32Array(N);
     const occupied = new Map();
-    const cell = (x, y) => (x + 4096) * 8192 + (y + 4096);
-
-    // Initial placement: snap geography to the grid, busiest stations first.
-    const byDegree = [...Array(N).keys()].sort((a, b) => inc[b].length - inc[a].length);
+    const byDegree = [...Array(N).keys()].sort((a, b) => incident[b].length - incident[a].length);
     for (const i of byDegree) {
       const rx = Math.round(gx[i]);
       const ry = Math.round(gy[i]);
@@ -284,7 +246,7 @@
             if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
             const x = rx + dx;
             const y = ry + dy;
-            if (occupied.has(cell(x, y))) continue;
+            if (occupied.has(cellKey(x, y))) continue;
             const d = (x - gx[i]) ** 2 + (y - gy[i]) ** 2;
             if (d < bestD) {
               bestD = d;
@@ -295,8 +257,21 @@
       }
       X[i] = best[0];
       Y[i] = best[1];
-      occupied.set(cell(X[i], Y[i]), i);
+      occupied.set(cellKey(X[i], Y[i]), i);
     }
+    return { X, Y, occupied };
+  }
+
+  // ---- Optimisation -----------------------------------------------------------
+  // Local search: repeatedly move each station to the cheapest nearby free cell,
+  // swap stations that ended up on the wrong side of each other, and re-choose
+  // the bend order of non-octilinear edges.
+  function optimise(graph, opts, seed) {
+    const W = { ...BASE_WEIGHTS, ...opts.weights };
+    const rand = mulberry32(seed * 9973 + 17);
+    const problem = buildProblem(graph, opts, W);
+    const { nodes, N, gx, gy, edges: E, incident, neighbours, bends, bendsAt, pairs, pairsAt } = problem;
+    const { X, Y, occupied } = snapToGrid(problem);
 
     const poly = (k) => {
       const e = E[k];
@@ -320,7 +295,12 @@
       const L = Math.hypot(dx, dy) || 1;
       return [dx / L, dy / L];
     };
+    // Do edges k and f, which meet at node s, run on top of each other there?
+    const overlapAtShared = (k, f, s) =>
+      polylinesIntersect(trimEnd(poly(k), X[s], Y[s]), trimEnd(poly(f), X[s], Y[s]));
+    const isBent = (e) => !e.transfer && !isOctilinear(X[e.v] - X[e.u], Y[e.v] - Y[e.u]);
 
+    // ---- Cost terms ----
     function edgeCost(k) {
       const e = E[k];
       const dx = X[e.v] - X[e.u];
@@ -341,8 +321,9 @@
       return W.bend * Math.sqrt(b.weight) * bendPenalty(Math.PI - Math.acos(dot));
     }
 
+    // Edges leaving node i in the same direction.
     function overlapAt(i) {
-      const list = inc[i];
+      const list = incident[i];
       let c = 0;
       for (let a = 0; a < list.length; a++) {
         if (E[list[a]].transfer) continue;
@@ -359,41 +340,27 @@
     function crossCost(k) {
       const e = E[k];
       const p = poly(k);
-      const [x0, y0, x1, y1] = bbox(p);
+      const [x0, y0, x1, y1] = polylineBounds(p);
       let c = 0;
       for (let f = 0; f < E.length; f++) {
         if (f === k) continue;
         const g = E[f];
         const q = poly(f);
-        const [qx0, qy0, qx1, qy1] = bbox(q);
+        const [qx0, qy0, qx1, qy1] = polylineBounds(q);
         if (qx1 < x0 || qx0 > x1 || qy1 < y0 || qy0 > y1) continue;
-        const shared = g.u === e.u || g.u === e.v ? g.u : g.v === e.u || g.v === e.v ? g.v : -1;
+        const shared = sharedNode(e, g);
         if (shared < 0) {
           if (polylinesIntersect(p, q)) c += e.transfer || g.transfer ? W.transferCrossing : W.crossing;
         } else if (!e.transfer && !g.transfer) {
-          const sx = X[shared];
-          const sy = Y[shared];
-          if (polylinesIntersect(trimEnd(p, sx, sy), trimEnd(q, sx, sy))) c += W.overlap;
+          if (overlapAtShared(k, f, shared)) c += W.overlap;
         }
       }
       return c;
     }
 
-    // Choose the bend order of node i's bent edges so none leaves a station along
-    // the same direction as another edge.
-    function fixFlips(i) {
-      for (const k of inc[i]) {
-        const e = E[k];
-        if (e.transfer || isOctilinear(X[e.v] - X[e.u], Y[e.v] - Y[e.u])) continue;
-        const before = overlapAt(e.u) + overlapAt(e.v);
-        if (!before) continue;
-        e.flip = !e.flip;
-        if (overlapAt(e.u) + overlapAt(e.v) >= before) e.flip = !e.flip;
-      }
-    }
-
     const proximity = (d) => (d < 0.01 ? W.nodeOnEdge : d < 0.75 ? W.nodeNearEdge : 0);
 
+    // Stations lying on or next to edge k.
     function edgeProximity(k) {
       const e = E[k];
       const p = poly(k);
@@ -404,6 +371,7 @@
       return c;
     }
 
+    // Edges and unconnected stations crowding node i.
     function nodeProximity(i) {
       let c = 0;
       for (let f = 0; f < E.length; f++) {
@@ -411,67 +379,98 @@
         if (g.u !== i && g.v !== i) c += proximity(distanceToPolyline(X[i], Y[i], poly(f)));
       }
       for (let m = 0; m < N; m++) {
-        if (m === i || nbrs[i].has(m)) continue;
+        if (m === i || neighbours[i].has(m)) continue;
         if (Math.max(Math.abs(X[m] - X[i]), Math.abs(Y[m] - Y[i])) === 1) c += W.nodeNearNode;
       }
       return c;
     }
 
+    // Penalises pair pi being drawn in the opposite order to geography along
+    // either axis, or level when geography clearly separates them.
+    function orderCost(pi) {
+      const p = pairs[pi];
+      const dx = X[p.j] - X[p.i];
+      const dy = Y[p.j] - Y[p.i];
+      const side = (d, u) => {
+        const a = Math.abs(u);
+        if (a >= 0.3 && Math.sign(d) === -Math.sign(u)) return a;
+        if (a >= 0.6 && d === 0) return a * 0.4;
+        return 0;
+      };
+      return p.weight * (side(dx, p.ux) + side(dy, p.uy));
+    }
+
     // Every cost term that changes when node i moves.
     function localCost(i) {
       let c = W.geo * ((X[i] - gx[i]) ** 2 + (Y[i] - gy[i]) ** 2) + nodeProximity(i) + overlapAt(i);
-      for (const k of inc[i]) c += edgeCost(k) + crossCost(k) + edgeProximity(k);
+      for (const k of incident[i]) c += edgeCost(k) + crossCost(k) + edgeProximity(k);
       for (const b of bendsAt[i]) c += bendCost(b);
-      for (const j of nbrs[i]) c += overlapAt(j);
+      for (const j of neighbours[i]) c += overlapAt(j);
       for (const p of pairsAt[i]) c += orderCost(p);
       return c;
+    }
+
+    // ---- Moves ----
+    const saveFlips = (i) => incident[i].map((k) => E[k].flip);
+    const restoreFlips = (i, flips) => incident[i].forEach((k, n) => (E[k].flip = flips[n]));
+
+    // Choose the bend order of node i's bent edges so none leaves a station along
+    // the same direction as another edge.
+    function fixFlips(i) {
+      for (const k of incident[i]) {
+        const e = E[k];
+        if (!isBent(e)) continue;
+        const before = overlapAt(e.u) + overlapAt(e.v);
+        if (!before) continue;
+        e.flip = !e.flip;
+        if (overlapAt(e.u) + overlapAt(e.v) >= before) e.flip = !e.flip;
+      }
     }
 
     // Moves node i to the best free cell within radius r; returns true if it moved.
     function tryMove(i, r) {
       const ox = X[i];
       const oy = Y[i];
-      const savedFlips = inc[i].map((k) => E[k].flip);
-      const setFlips = (flips) => inc[i].forEach((k, n) => (E[k].flip = flips[n]));
+      const savedFlips = saveFlips(i);
       fixFlips(i);
       let best = localCost(i);
-      let bestFlips = inc[i].map((k) => E[k].flip);
+      let bestFlips = saveFlips(i);
       let bx = ox;
       let by = oy;
-      occupied.delete(cell(ox, oy));
+      occupied.delete(cellKey(ox, oy));
       for (let dx = -r; dx <= r; dx++) {
         for (let dy = -r; dy <= r; dy++) {
           if (!dx && !dy) continue;
           const x = ox + dx;
           const y = oy + dy;
-          if (occupied.has(cell(x, y))) continue;
+          if (occupied.has(cellKey(x, y))) continue;
           X[i] = x;
           Y[i] = y;
-          setFlips(savedFlips);
+          restoreFlips(i, savedFlips);
           fixFlips(i);
           const c = localCost(i);
-          if (c < best - 1e-6) {
+          if (c < best - MIN_GAIN) {
             best = c;
             bx = x;
             by = y;
-            bestFlips = inc[i].map((k) => E[k].flip);
+            bestFlips = saveFlips(i);
           }
         }
       }
       X[i] = bx;
       Y[i] = by;
-      setFlips(bestFlips);
-      occupied.set(cell(bx, by), i);
+      restoreFlips(i, bestFlips);
+      occupied.set(cellKey(bx, by), i);
       return bx !== ox || by !== oy;
     }
 
     function flipPass() {
       let changed = 0;
       for (const e of E) {
-        if (e.transfer || isOctilinear(X[e.v] - X[e.u], Y[e.v] - Y[e.u])) continue;
+        if (!isBent(e)) continue;
         const before = localCost(e.u) + localCost(e.v);
         e.flip = !e.flip;
-        if (localCost(e.u) + localCost(e.v) >= before - 1e-6) e.flip = !e.flip;
+        if (localCost(e.u) + localCost(e.v) >= before - MIN_GAIN) e.flip = !e.flip;
         else changed++;
       }
       return changed;
@@ -484,8 +483,8 @@
       pairs.forEach((p, k) => {
         if (!orderCost(k)) return;
         const { i, j } = p;
-        const flipsI = inc[i].map((e) => E[e].flip);
-        const flipsJ = inc[j].map((e) => E[e].flip);
+        const flipsI = saveFlips(i);
+        const flipsJ = saveFlips(j);
         const before = localCost(i) + localCost(j);
         const swap = () => {
           [X[i], X[j]] = [X[j], X[i]];
@@ -494,38 +493,39 @@
         swap();
         fixFlips(i);
         fixFlips(j);
-        if (localCost(i) + localCost(j) < before - 1e-6) {
-          occupied.set(cell(X[i], Y[i]), i);
-          occupied.set(cell(X[j], Y[j]), j);
+        if (localCost(i) + localCost(j) < before - MIN_GAIN) {
+          occupied.set(cellKey(X[i], Y[i]), i);
+          occupied.set(cellKey(X[j], Y[j]), j);
           changed++;
         } else {
           swap();
-          inc[i].forEach((e, n) => (E[e].flip = flipsI[n]));
-          inc[j].forEach((e, n) => (E[e].flip = flipsJ[n]));
+          restoreFlips(i, flipsI);
+          restoreFlips(j, flipsJ);
         }
       });
       return changed;
     }
 
+    // Visits every pair of track (non-transfer) edges k < f.
+    function forEachTrackPair(visit) {
+      for (let k = 0; k < E.length; k++) {
+        if (E[k].transfer) continue;
+        for (let f = k + 1; f < E.length; f++) {
+          if (!E[f].transfer) visit(k, f, sharedNode(E[k], E[f]));
+        }
+      }
+    }
+
     // Nodes at either end of edges that are drawn on top of another edge.
     function overlappingNodes() {
       const bad = new Set();
-      for (let k = 0; k < E.length; k++) {
-        const e = E[k];
-        if (e.transfer) continue;
-        for (let f = k + 1; f < E.length; f++) {
-          const g = E[f];
-          if (g.transfer) continue;
-          const s = g.u === e.u || g.u === e.v ? g.u : g.v === e.u || g.v === e.v ? g.v : -1;
-          if (s < 0) continue;
-          if (polylinesIntersect(trimEnd(poly(k), X[s], Y[s]), trimEnd(poly(f), X[s], Y[s]))) {
-            [e.u, e.v, g.u, g.v].forEach((n) => bad.add(n));
-          }
-        }
-      }
+      forEachTrackPair((k, f, s) => {
+        if (s >= 0 && overlapAtShared(k, f, s)) [E[k].u, E[k].v, E[f].u, E[f].v].forEach((n) => bad.add(n));
+      });
       return bad;
     }
 
+    // ---- Main loop ----
     const order = [...Array(N).keys()];
     const maxIterations = opts.iterations ?? 40;
     for (let iter = 0; iter < maxIterations; iter++) {
@@ -550,6 +550,7 @@
       flipPass();
     }
 
+    // ---- Result ----
     let minX = Infinity;
     let minY = Infinity;
     for (let i = 0; i < N; i++) {
@@ -559,29 +560,25 @@
     const pos = new Map();
     nodes.forEach((s, i) => pos.set(s.id, { x: X[i] - minX, y: Y[i] - minY }));
     const flip = new Map();
-    let nonOctilinear = 0;
-    let crossings = 0;
-    let overlaps = 0;
-    E.forEach((e, k) => {
-      if (e.transfer) return;
-      flip.set(e.key, e.flip);
-      if (!isOctilinear(X[e.v] - X[e.u], Y[e.v] - Y[e.u])) nonOctilinear++;
-      for (let f = k + 1; f < E.length; f++) {
-        const g = E[f];
-        if (g.transfer) continue;
-        const shared = g.u === e.u || g.u === e.v ? g.u : g.v === e.u || g.v === e.v ? g.v : -1;
-        if (shared < 0) {
-          if (polylinesIntersect(poly(k), poly(f))) crossings++;
-        } else if (polylinesIntersect(trimEnd(poly(k), X[shared], Y[shared]), trimEnd(poly(f), X[shared], Y[shared]))) {
-          overlaps++;
-        }
+    for (const e of E) if (!e.transfer) flip.set(e.key, e.flip);
+
+    const stats = {
+      nonOctilinear: E.filter(isBent).length,
+      crossings: 0,
+      overlaps: 0,
+      swapped: pairs.filter((p, k) => orderCost(k) > 0).length,
+    };
+    forEachTrackPair((k, f, s) => {
+      if (s < 0) {
+        if (polylinesIntersect(poly(k), poly(f))) stats.crossings++;
+      } else if (overlapAtShared(k, f, s)) {
+        stats.overlaps++;
       }
     });
 
-    const swapped = pairs.filter((p, k) => orderCost(k) > 0).length;
     let cost = 0;
     for (let i = 0; i < N; i++) cost += localCost(i);
-    return { pos, flip, schematic: true, cost, stats: { nonOctilinear, crossings, overlaps, swapped } };
+    return { pos, flip, schematic: true, cost, stats };
   }
 
   MM.gridPolyline = gridPolyline;

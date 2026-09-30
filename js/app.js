@@ -33,6 +33,7 @@
 
   const escapeHtml = (s) =>
     String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  const lineChip = (l) => `<span class="chip"><i style="background:${l.color}"></i>${escapeHtml(l.name)}</span>`;
 
   function showMessage(html) {
     message.innerHTML = html;
@@ -137,10 +138,7 @@
     const title = f.type === 'line'
       ? escapeHtml(lineById(f.id).name)
       : escapeHtml(stationInfo(f.id).station.labels.join(' / '));
-    const chips = [...set]
-      .map(lineById)
-      .map((l) => `<span class="chip"><i style="background:${l.color}"></i>${escapeHtml(l.name)}</span>`)
-      .join('');
+    const chips = [...set].map(lineById).map(lineChip).join('');
     focusBar.innerHTML =
       `<span class="focus-title">${f.type === 'line' ? 'Line' : 'Station'}: <strong>${title}</strong></span>` +
       (f.type === 'station' ? `<span class="chips">${chips}</span>` : '') +
@@ -261,7 +259,7 @@
     }
     tooltip.innerHTML =
       s.station.labels.map((n) => `<strong>${escapeHtml(n)}</strong>`).join('') +
-      s.lines.map((l) => `<span class="chip"><i style="background:${l.color}"></i>${escapeHtml(l.name)}</span>`).join('');
+      s.lines.map(lineChip).join('');
     tooltip.hidden = false;
     tooltip.style.left = `${e.clientX + 14}px`;
     tooltip.style.top = `${e.clientY + 14}px`;
@@ -319,8 +317,8 @@
     const markup =
       `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" class="${svg.classList.contains('dim') ? 'dim' : ''}">` +
       `<style>${MM.MAP_CSS} .line, .marker, .transfer, .label { transition: none; }` +
-      ` .legend { font: 500 13px "Helvetica Neue", Helvetica, Arial, sans-serif; fill: #1b1b1b; }` +
-      ` .legend-title { font: 700 15px "Helvetica Neue", Helvetica, Arial, sans-serif; fill: #1b1b1b; }</style>` +
+      ` .legend { font: 500 13px ${MM.FONT.family}; fill: #1b1b1b; }` +
+      ` .legend-title { font: 700 15px ${MM.FONT.family}; fill: #1b1b1b; }</style>` +
       `<rect width="100%" height="100%" fill="#fff"/>` +
       new XMLSerializer().serializeToString(content) +
       `<text x="${lx}" y="${margin + 12}" class="legend-title">Lines</text>${legend}</svg>`;
