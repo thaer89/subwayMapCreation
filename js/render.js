@@ -243,34 +243,154 @@ svg.dim .line.active, svg.dim .marker.active, svg.dim .transfer.active, svg.dim 
     };
     const leftness = (din, dout) =>
       -Math.atan2(din.x * dout.y - din.y * dout.x, din.x * dout.x + din.y * dout.y);
-    function side(A, B, from, to) {
+    // Walks A and B together from `from`→`to`. `result` is -1 if A must sit left
+    // of B (relative to that travel direction), 1 if right, 0 if undecided;
+    // `run` lists the shared edges visited, with +1 when travelled a→b.
+    function walkTogether(A, B, from, to) {
+      const run = [];
+      const visit = (p, c) => {
+        const e = edgeOf(p, c);
+        run.push({ key: e.key, dir: p === e.a ? 1 : -1 });
+      };
       let prev = from;
       let cur = to;
+      visit(prev, cur);
       for (let step = 0; step < 500; step++) {
         const nA = nextOn(A, prev, cur);
         const nB = nextOn(B, prev, cur);
-        if (nA == null || nB == null) return 0;
+        if (nA == null || nB == null) return { result: 0, run };
         if (nA !== nB) {
           const back = dirFrom(cur, prev);
           const din = { x: -back.x, y: -back.y };
           const lA = leftness(din, dirFrom(cur, nA));
           const lB = leftness(din, dirFrom(cur, nB));
-          if (Math.abs(lA - lB) < 1e-6) return 0;
-          return lA > lB ? -1 : 1;
+          if (Math.abs(lA - lB) < 1e-6) return { result: 0, run };
+          return { result: lA > lB ? -1 : 1, run };
         }
         prev = cur;
         cur = nA;
-        if (prev === from && cur === to) return 0;
+        if (prev === from && cur === to) return { result: 0, run };
+        visit(prev, cur);
       }
-      return 0;
+      return { result: 0, run };
+    }
+
+    function compareOnEdge(A, B, e) {
+      const fwd = walkTogether(A, B, e.a, e.b);
+      if (fwd.result) return fwd.result;
+      const bwd = walkTogether(A, B, e.b, e.a);
+      if (bwd.result) return -bwd.result;
+      // Lines that never part (or only end): fix their order once, on the
+      // smallest edge key of the shared run, so every edge of the run agrees
+      // and the lines do not swap sides at stations.
+      let anchor = null;
+      for (const r of fwd.run) if (!anchor || r.key < anchor.key) anchor = r;
+      for (const r of bwd.run) if (!anchor || r.key < anchor.key) anchor = { key: r.key, dir: -r.dir };
+      return Math.sign(A.index - B.index) * anchor.dir;
     }
 
     const offsets = new Map();
     for (const e of graph.edges.values()) {
       const ls = edgeLines.get(e.key).slice();
-      ls.sort((A, B) => side(A, B, e.a, e.b) || -side(A, B, e.b, e.a) || A.index - B.index);
+      ls.sort((A, B) => compareOnEdge(A, B, e));
       const k = ls.length;
       offsets.set(e.key, new Map(ls.map((l, i) => [l.id, ((k - 1) / 2 - i) * spacing])));
+    }
+
+    // ---- Keep lines on the same track through stations -------------------------
+    // Each edge's bundle is centred by default, so a line jumps sideways wherever
+    // the bundle gains or loses a line. Slide whole bundles to positions that line
+    // continuing lines up exactly, minimising the number of jumps with a small
+    // cost for moving a bundle off centre.
+    {
+      const links = new Map(); // edge key -> [{ line, other, sign }]
+      for (const e of graph.edges.values()) links.set(e.key, []);
+      for (const line of visible) {
+        for (const [sid, adj] of line.adj) {
+          if (adj.length !== 2) continue;
+          const e1 = edgeOf(adj[0], sid);
+          const e2 = edgeOf(sid, adj[1]);
+          if (!offsets.get(e1.key).has(line.id) || !offsets.get(e2.key).has(line.id)) continue;
+          // Travel offset = travel sign × (canonical offset); equal on both sides means
+          // canonical offsets relate by the product of the two travel signs.
+          const sign = (adj[0] === e1.a ? 1 : -1) * (sid === e2.a ? 1 : -1);
+          links.get(e1.key).push({ line: line.id, other: e2.key, sign });
+          links.get(e2.key).push({ line: line.id, other: e1.key, sign });
+        }
+      }
+      const shift = new Map([...links.keys()].map((k) => [k, 0]));
+      let fixed = null; // while seeding, only already-placed neighbours count
+      const cost = (key, c) => {
+        const own = offsets.get(key);
+        let total = (Math.abs(c) / spacing) * 0.35;
+        for (const { line, other, sign } of links.get(key)) {
+          if (fixed && !fixed.has(other)) continue;
+          const d = Math.abs(sign * (offsets.get(other).get(line) + shift.get(other)) - (own.get(line) + c));
+          if (d > 0.5) total += 1 + (d / spacing) * 0.1;
+        }
+        return total;
+      };
+      const candidatesFor = (key) => {
+        const own = offsets.get(key);
+        return [0, ...links.get(key)
+          .filter(({ other }) => !fixed || fixed.has(other))
+          .map(({ line, other, sign }) => sign * (offsets.get(other).get(line) + shift.get(other)) - own.get(line))];
+      };
+
+      // Seed: spread outwards from the busiest edges, aligning each edge with the
+      // neighbours already placed.
+      fixed = new Set();
+      const byBundle = [...links.keys()].sort((a, b) => offsets.get(b).size - offsets.get(a).size);
+      for (const start of byBundle) {
+        if (fixed.has(start)) continue;
+        fixed.add(start);
+        const queue = [start];
+        while (queue.length) {
+          const key = queue.shift();
+          for (const { other } of links.get(key)) {
+            if (fixed.has(other)) continue;
+            let best = 0;
+            let bestCost = Infinity;
+            for (const c of candidatesFor(other)) {
+              const v = cost(other, c);
+              if (v < bestCost - 1e-9) {
+                bestCost = v;
+                best = c;
+              }
+            }
+            shift.set(other, best);
+            fixed.add(other);
+            queue.push(other);
+          }
+        }
+      }
+      fixed = null;
+
+      for (let iter = 0; iter < 20; iter++) {
+        let changed = false;
+        for (const [key, list] of links) {
+          if (!list.length) continue;
+          const candidates = candidatesFor(key);
+          let best = shift.get(key);
+          let bestCost = cost(key, best);
+          for (const c of candidates) {
+            const v = cost(key, c);
+            if (v < bestCost - 1e-9) {
+              bestCost = v;
+              best = c;
+            }
+          }
+          if (best !== shift.get(key)) {
+            shift.set(key, best);
+            changed = true;
+          }
+        }
+        if (!changed) break;
+      }
+      for (const [key, s] of shift) {
+        const own = offsets.get(key);
+        for (const [id, o] of own) own.set(id, o + s);
+      }
     }
 
     // ---- Shared corridors ------------------------------------------------------
@@ -343,6 +463,7 @@ svg.dim .line.active, svg.dim .marker.active, svg.dim .transfer.active, svg.dim 
     const shiftOf = (e, j) => segShift.get(`${e.key}:${j}`) || 0;
 
     // ---- Offset polylines per line ------------------------------------------
+    const stationCorners = new Map();
     function chainPoints(line, chain) {
       const st = chain.stations;
       const segs = [];
@@ -365,6 +486,7 @@ svg.dim .line.active, svg.dim .marker.active, svg.dim .transfer.active, svg.dim 
             b: { x: p2.x + n.x * o, y: p2.y + n.y * o },
             d, o, len,
             stop: j === pts.length - 2,
+            at: j === pts.length - 2 ? st[i + 1] : null,
           });
         }
       }
@@ -388,12 +510,22 @@ svg.dim .line.active, svg.dim .marker.active, svg.dim .transfer.active, svg.dim 
         return [{ x: s1.a.x + s1.d.x * t, y: s1.a.y + s1.d.y * t, o: (s1.o + s2.o) / 2, stop: s1.stop }];
       };
 
+      // Where a line turns at a station its corner can sit off the edge ends, so
+      // the marker has to cover the corner too.
+      const joinAt = (s1, s2) => {
+        const J = join(s1, s2);
+        if (s1.at != null) {
+          if (!stationCorners.has(s1.at)) stationCorners.set(s1.at, []);
+          stationCorners.get(s1.at).push(...J);
+        }
+        return J;
+      };
       const inner = [];
-      for (let i = 1; i < segs.length; i++) inner.push(...join(segs[i - 1], segs[i]));
+      for (let i = 1; i < segs.length; i++) inner.push(...joinAt(segs[i - 1], segs[i]));
       const first = segs[0];
       const last = segs[segs.length - 1];
       if (chain.closed && segs.length > 2) {
-        const J = join(last, first);
+        const J = joinAt(last, first);
         return { pts: [J[J.length - 1], ...inner, ...J.slice(0, -1)], closed: true };
       }
       return { pts: [{ ...first.a, o: first.o }, ...inner, { ...last.b, o: last.o }], closed: false };
@@ -418,8 +550,18 @@ svg.dim .line.active, svg.dim .marker.active, svg.dim .transfer.active, svg.dim 
 
     // ---- Stations -------------------------------------------------------------
     const info = new Map();
+    // Strokes (with their white casing) closer than this visibly cover each other.
+    const touch = lineWidth + Math.min(gap * 1.6, 6) / 4;
+    const distToSeg = (q, a, b) => {
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const len2 = dx * dx + dy * dy;
+      const t = len2 ? Math.max(0, Math.min(1, ((q.x - a.x) * dx + (q.y - a.y) * dy) / len2)) : 0;
+      return Math.hypot(q.x - a.x - dx * t, q.y - a.y - dy * t);
+    };
     for (const s of graph.stations.values()) {
       const pts = [];
+      const rays = [];
       const lines = new Set();
       for (const e of s.edges) {
         const off = offsets.get(e.key);
@@ -427,12 +569,35 @@ svg.dim .line.active, svg.dim .marker.active, svg.dim .transfer.active, svg.dim 
         const p = polys.get(e.key);
         const atA = s.id === e.a;
         const base = atA ? p[0] : p[p.length - 1];
-        const n = leftNormal(atA ? unitVec(p[0], p[1]) : unitVec(p[p.length - 2], p[p.length - 1]));
+        const next = atA ? p[1] : p[p.length - 2];
+        const out = unitVec(base, next);
+        const n = leftNormal(atA ? out : { x: -out.x, y: -out.y });
         const shift = shiftOf(e, atA ? 0 : p.length - 2);
-        for (const o of off.values()) pts.push({ x: base.x + n.x * (o + shift), y: base.y + n.y * (o + shift) });
+        const reach = Math.hypot(next.x - base.x, next.y - base.y) * 0.4;
+        for (const [id, o] of off) {
+          const a = { x: base.x + n.x * (o + shift), y: base.y + n.y * (o + shift) };
+          pts.push(a);
+          rays.push({ e, id, a, b: { x: a.x + out.x * reach, y: a.y + out.y * reach }, out, reach });
+        }
         for (const l of edgeLines.get(e.key)) lines.add(l);
       }
       if (!lines.size) continue;
+      for (const c of stationCorners.get(s.id) || []) pts.push({ x: c.x, y: c.y });
+      // Grow the marker along each line until it no longer touches lines arriving
+      // from other directions, so the overlap is hidden under the station.
+      // Lines bending together from one edge onto another are joined smoothly.
+      const turnsTogether = (r, o) => r.id === o.id
+        || (offsets.get(r.e.key).has(o.id) && offsets.get(o.e.key).has(r.id));
+      const step = Math.max(1, lineWidth / 3);
+      for (const r of rays) {
+        const others = rays.filter((o) => o.e !== r.e && !turnsTogether(r, o));
+        let extent = 0;
+        for (let t = step; t <= r.reach; t += step) {
+          const q = { x: r.a.x + r.out.x * t, y: r.a.y + r.out.y * t };
+          if (others.some((o) => distToSeg(q, o.a, o.b) < touch)) extent = t;
+        }
+        if (extent) pts.push({ x: r.a.x + r.out.x * extent, y: r.a.y + r.out.y * extent });
+      }
       info.set(s.id, { station: s, center: P(s.id), hull: convexHull(pts), lines: [...lines], transfer: false });
     }
     const transfers = graph.transfers.filter((t) => info.has(t.a) && info.has(t.b));
@@ -571,7 +736,7 @@ svg.dim .line.active, svg.dim .marker.active, svg.dim .transfer.active, svg.dim 
     for (const [p, q] of obstacles) {
       grow({ x0: Math.min(p.x, q.x), y0: Math.min(p.y, q.y), x1: Math.max(p.x, q.x), y1: Math.max(p.y, q.y) });
     }
-    return { bounds, info };
+    return { bounds, info, offsets };
   }
 
   MM.render = render;

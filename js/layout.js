@@ -2,7 +2,7 @@
   'use strict';
 
   // Penalty weights for the schematic optimiser. Positions are integer grid cells.
-  const W = {
+  const BASE_WEIGHTS = {
     nonOctilinear: 30,
     tooShort: 14,
     length: 1.0,
@@ -10,12 +10,13 @@
     bend: 2.5,
     crossing: 16,
     transferCrossing: 4,
-    overlap: 400, // two edges drawn on top of each other: effectively forbidden
+    overlap: 40, // edges leaving a station together; the renderer runs them side by side
     nodeOnEdge: 60,
     nodeNearEdge: 4,
     nodeNearNode: 3,
     geo: 0.05,
     transfer: 8,
+    order: 40, // nearby stations swapping sides (east↔west, north↔south)
   };
   // Penalty for a line turning by 0°, 45°, 90°, 135°, 180° at a station.
   const BEND_TABLE = [0, 1, 4, 25, 60];
@@ -157,8 +158,20 @@
     return { pos: normalizedGeo(graph, scale), flip: new Map(), schematic: false, stats: null };
   }
 
+  // Runs several independent optimisations and keeps the one with the lowest cost.
   function layoutSchematic(graph, opts = {}) {
-    const rand = mulberry32((opts.seed ?? 1) * 9973 + 17);
+    const seed = opts.seed ?? 1;
+    let best = null;
+    for (let r = 0; r < (opts.restarts ?? 3); r++) {
+      const result = optimise(graph, opts, seed * 7919 + r * 104729);
+      if (!best || result.cost < best.cost) best = result;
+    }
+    return best;
+  }
+
+  function optimise(graph, opts, seed) {
+    const W = { ...BASE_WEIGHTS, ...opts.weights };
+    const rand = mulberry32(seed * 9973 + 17);
     const scale = (opts.targetEdge ?? 2.6) / graph.medianEdgeLength;
     const geo = normalizedGeo(graph, scale);
     const nodes = [...graph.stations.values()];
@@ -221,6 +234,37 @@
         if (ch.closed && n > 3) addBend(st[n - 2], st[0], st[1]);
       }
     }
+
+    // Station pairs whose relative position (which one is further east / north)
+    // should survive schematisation: connected stations plus geographic neighbours.
+    const pairs = [];
+    const pairsAt = Array.from({ length: N }, () => []);
+    const orderRadius = 2 * (opts.targetEdge ?? 2.6); // two median edge lengths
+    for (let i = 0; i < N; i++) {
+      for (let j = i + 1; j < N; j++) {
+        const dx = gx[j] - gx[i];
+        const dy = gy[j] - gy[i];
+        const d = Math.hypot(dx, dy);
+        const linked = nbrs[i].has(j);
+        if (!d || (!linked && d > orderRadius)) continue;
+        const pair = { i, j, ux: dx / d, uy: dy / d, weight: W.order * (linked ? 1.5 : 1) };
+        pairsAt[i].push(pairs.length);
+        pairsAt[j].push(pairs.length);
+        pairs.push(pair);
+      }
+    }
+    const orderCost = (pi) => {
+      const p = pairs[pi];
+      const dx = X[p.j] - X[p.i];
+      const dy = Y[p.j] - Y[p.i];
+      const side = (d, u) => {
+        const a = Math.abs(u);
+        if (a >= 0.3 && Math.sign(d) === -Math.sign(u)) return a;
+        if (a >= 0.6 && d === 0) return a * 0.4; // clearly east (say) but drawn level
+        return 0;
+      };
+      return p.weight * (side(dx, p.ux) + side(dy, p.uy));
+    };
 
     const X = new Int32Array(N);
     const Y = new Int32Array(N);
@@ -379,6 +423,7 @@
       for (const k of inc[i]) c += edgeCost(k) + crossCost(k) + edgeProximity(k);
       for (const b of bendsAt[i]) c += bendCost(b);
       for (const j of nbrs[i]) c += overlapAt(j);
+      for (const p of pairsAt[i]) c += orderCost(p);
       return c;
     }
 
@@ -432,6 +477,36 @@
       return changed;
     }
 
+    // Exchanges the positions of stations that ended up on the wrong side of each
+    // other, which single-station moves cannot do when they block each other.
+    function swapPass() {
+      let changed = 0;
+      pairs.forEach((p, k) => {
+        if (!orderCost(k)) return;
+        const { i, j } = p;
+        const flipsI = inc[i].map((e) => E[e].flip);
+        const flipsJ = inc[j].map((e) => E[e].flip);
+        const before = localCost(i) + localCost(j);
+        const swap = () => {
+          [X[i], X[j]] = [X[j], X[i]];
+          [Y[i], Y[j]] = [Y[j], Y[i]];
+        };
+        swap();
+        fixFlips(i);
+        fixFlips(j);
+        if (localCost(i) + localCost(j) < before - 1e-6) {
+          occupied.set(cell(X[i], Y[i]), i);
+          occupied.set(cell(X[j], Y[j]), j);
+          changed++;
+        } else {
+          swap();
+          inc[i].forEach((e, n) => (E[e].flip = flipsI[n]));
+          inc[j].forEach((e, n) => (E[e].flip = flipsJ[n]));
+        }
+      });
+      return changed;
+    }
+
     // Nodes at either end of edges that are drawn on top of another edge.
     function overlappingNodes() {
       const bad = new Set();
@@ -461,6 +536,7 @@
       }
       let changed = 0;
       for (const i of order) if (tryMove(i, r)) changed++;
+      changed += swapPass();
       changed += flipPass();
       if (!changed && r === 1) break;
     }
@@ -502,7 +578,10 @@
       }
     });
 
-    return { pos, flip, schematic: true, stats: { nonOctilinear, crossings, overlaps } };
+    const swapped = pairs.filter((p, k) => orderCost(k) > 0).length;
+    let cost = 0;
+    for (let i = 0; i < N; i++) cost += localCost(i);
+    return { pos, flip, schematic: true, cost, stats: { nonOctilinear, crossings, overlaps, swapped } };
   }
 
   MM.gridPolyline = gridPolyline;
